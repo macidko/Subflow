@@ -74,19 +74,25 @@ class StorageManager {
    * @param {Object} items - Key-value pairs to save
    * @returns {Promise<void>}
    */
-  async _setInternal(items) {
+  async _setInternal(items, options = {}) {
     if (!this.initialized) {
       throw new Error('[StorageManager] Not initialized! Call initialize() first.');
     }
 
-    // To avoid cross-context race overwrites, always read the latest
-    // values from chrome.storage.local before merging and writing.
-    // This ensures we don't accidentally overwrite changes made by other
-    // extension contexts (popup/background/content scripts).
-    const latestRemote = await chrome.storage.local.get();
+    const { skipRemoteRead = false } = options;
 
-    // Merge remote state with our items, giving priority to items
-    const merged = { ...latestRemote, ...items };
+    // If caller already read the freshest remote state (e.g. moveToSet),
+    // allow skipping the extra remote read to avoid double reads and races.
+    let baseRemote;
+    if (skipRemoteRead) {
+      // Use our cached view as the base to merge against.
+      baseRemote = { ...(this.cache || {}) };
+    } else {
+      baseRemote = await chrome.storage.local.get();
+    }
+
+    // Merge remote/base state with our items, giving priority to items
+    const merged = { ...baseRemote, ...items };
 
     // Write merged state back to storage
     await chrome.storage.local.set(merged);
@@ -94,7 +100,7 @@ class StorageManager {
     // Update cache to the freshly written merged state
     this.cache = merged;
 
-    console.log('[StorageManager] SET (merged with remote):', Object.keys(items), '→ Success');
+    console.log('[StorageManager] SET (merged with remote):', Object.keys(items), '→ Success (skipRemoteRead=', skipRemoteRead, ')');
   }
 
   /**
@@ -199,7 +205,7 @@ class StorageManager {
   async moveToSet(fromKey, toKey, item) {
     const resultPromise = this.queue.then(async () => {
       try {
-        // Read latest arrays from remote storage to avoid operating on stale cache
+        // Read latest arrays from remote storage once to avoid operating on stale cache
         const remote = await chrome.storage.local.get([fromKey, toKey]);
         const fromArray = (remote && remote[fromKey]) ? remote[fromKey] : (this.cache[fromKey] || []);
         const toArray = (remote && remote[toKey]) ? remote[toKey] : (this.cache[toKey] || []);
@@ -211,11 +217,12 @@ class StorageManager {
         fromSet.delete(item);
         toSet.add(item);
 
-        // Save both atomically (internal method merges with latest remote)
+        // We already fetched the freshest remote slices; call internal setter
+        // but skip the internal remote-read (we already have fresh data).
         await this._setInternal({
           [fromKey]: Array.from(fromSet),
           [toKey]: Array.from(toSet)
-        });
+        }, { skipRemoteRead: true });
 
         console.log('[StorageManager] MOVE (based on remote):', item, 'from', fromKey, 'to', toKey);
       } catch (error) {

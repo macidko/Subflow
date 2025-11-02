@@ -577,8 +577,115 @@ window.PerfectMimicSubtitleSystem = class PerfectMimicSubtitleSystem {
 
   // Event Handlers
 
-  onStructureChange() {
-    this.scanAndMirror();
+  onStructureChange(mutations) {
+    // If no mutations provided, fallback to full rescan
+    if (!mutations || mutations.length === 0) {
+      this.scanAndMirror();
+      return;
+    }
+
+    const addedLines = [];
+    const removedLines = [];
+
+    mutations.forEach(m => {
+      if (m.type !== 'childList') return;
+
+      m.addedNodes.forEach(node => {
+        try {
+          if (node.matches && node.matches('.caption-visual-line, .ytp-caption-segment')) {
+            addedLines.push(node);
+          } else if (node.querySelectorAll) {
+            // Some added nodes are containers; find child lines
+            const found = node.querySelectorAll('.caption-visual-line, .ytp-caption-segment');
+            found.forEach(n => addedLines.push(n));
+          }
+        } catch (e) {
+          // Ignore any matching errors
+        }
+      });
+
+      m.removedNodes.forEach(node => {
+        try {
+          if (node.matches && node.matches('.caption-visual-line, .ytp-caption-segment')) {
+            removedLines.push(node);
+          } else if (node.querySelectorAll) {
+            const found = node.querySelectorAll('.caption-visual-line, .ytp-caption-segment');
+            found.forEach(n => removedLines.push(n));
+          }
+        } catch (e) {}
+      });
+    });
+
+    // If many changes, fallback to full scan to avoid complex diff logic
+    const totalChanges = addedLines.length + removedLines.length;
+    if (totalChanges === 0) return; // nothing to do
+    if (totalChanges > 8) { // threshold: if too many, do full rescan
+      this.scanAndMirror();
+      return;
+    }
+
+    try {
+      this.updateIncrementally(addedLines, removedLines);
+    } catch (err) {
+      console.error('[PerfectMimic] incremental update failed, falling back to full rescan', err);
+      this.scanAndMirror();
+    }
+  }
+
+  /**
+   * Update mimic lines incrementally using a single fresh scan of native lines.
+   * - Updates existing lines in-place
+   * - Appends newly added lines
+   * - Removes deleted lines
+   * Falls back to full rebuild on ambiguity.
+   */
+  updateIncrementally(addedLines, removedLines) {
+    // Perform one fresh scan to get current ordered native lines
+    const nativeLines = this.scanNativeLines();
+
+    // Quick sanity check
+    if (!Array.isArray(nativeLines)) {
+      this.scanAndMirror();
+      return;
+    }
+
+    const newCount = nativeLines.length;
+    const oldCount = this.mimicLines.length || 0;
+
+    // If no mimic container yet, just rebuild
+    if (!this.mimicContainer) {
+      this.rebuildMimicLines(nativeLines);
+      this.domState.lineCount = newCount;
+      return;
+    }
+
+    // Update overlapping range
+    const minCount = Math.min(oldCount, newCount);
+    for (let i = 0; i < minCount; i++) {
+      this.updateMimicLineText(i, nativeLines[i].text);
+      this.mirrorLineStyles(i, nativeLines[i].element);
+    }
+
+    // Append additional new lines
+    if (newCount > oldCount) {
+      for (let i = oldCount; i < newCount; i++) {
+        const mimicLine = this.createMimicLine(nativeLines[i]);
+        this.mimicContainer.appendChild(mimicLine);
+        this.mimicLines.push(mimicLine);
+      }
+    }
+
+    // Remove surplus old lines
+    if (newCount < oldCount) {
+      for (let i = oldCount - 1; i >= newCount; i--) {
+        const node = this.mimicLines[i];
+        try { if (node && node.parentNode) node.parentNode.removeChild(node); } catch (e) {}
+        this.mimicLines.pop();
+      }
+    }
+
+    // Update domState
+    this.domState.lineCount = newCount;
   }
 
   onTextChange(node) {

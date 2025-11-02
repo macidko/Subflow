@@ -66,14 +66,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     };
 
     const flushPendingWrites = async (attempt = 1) => {
+      // No-op if nothing to flush
       if (!globalThis._pendingWrites || Object.keys(globalThis._pendingWrites).length === 0) return;
+
+      // Prevent concurrent flush runs
+      if (globalThis._flushInProgress) return;
+      globalThis._flushInProgress = true;
+
+      // Snapshot current pending writes and clear buffer so new writes can accumulate
       const toWrite = { ...globalThis._pendingWrites };
-      // Clear pending now to accept new writes
       globalThis._pendingWrites = {};
 
-      // If small, write all at once
       const keys = Object.keys(toWrite);
-      if (keys.length === 0) return;
+      if (keys.length === 0) {
+        globalThis._flushInProgress = false;
+        return;
+      }
 
       const chunkSize = 20; // simple granularity: write up to 20 keys per chunk
 
@@ -115,15 +123,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         globalThis._flushAttempt = 0;
         return true;
       } catch (err) {
-        // On failure, re-merge remaining keys back into pendingWrites so they aren't lost
-        // If err occurred in the middle, compute which keys remain
-        const remaining = {};
-        const flushedKeys = Object.keys(globalThis._flushMetrics.lastFlushError ? {} : {}); // placeholder
-        // Simpler: re-merge everything that still isn't in storage by merging toWrite back
+        // On failure, re-merge toWrite back into pendingWrites so nothing is lost.
+        // Newer writes that arrived during the flush should win -- merge so
+        // newer keys override older ones: existing pending writes are spread last.
         globalThis._pendingWrites = { ...toWrite, ...globalThis._pendingWrites };
         globalThis._flushAttempt = 0;
         console.error('[Background] flushPendingWrites permanent failure:', err);
         throw err;
+      } finally {
+        globalThis._flushInProgress = false;
       }
     };
 

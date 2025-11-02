@@ -1,240 +1,202 @@
 // 🎭 Word Manager - Word state management and actions
 
 // Make class globally available
-window.WordManager = class WordManager {
+globalThis.WordManager = class WordManager {
+  // Initialize queue as a class field to avoid async work inside the constructor
+  _syncQueue = Promise.resolve();
+
   constructor(subtitleSystem) {
     this.system = subtitleSystem;
-    this.syncLock = false; // Prevent race conditions
-    this.pendingSync = null; // Debounced sync
+    // Promise-based FIFO queue to serialize storage/UI sync operations
+    this.pendingSync = null; // Debounced sync (kept for compatibility)
+  }
+  async _enqueueSync(jobFn) {
+    // Chain jobs so they run sequentially. Any thrown error is logged but
+    // doesn't break the queue chain (we keep it resolving to allow future work).
+    this._syncQueue = this._syncQueue.then(() => jobFn()).catch(err => {
+      console.error('[WordManager] queued job error:', err);
+    });
+    return this._syncQueue;
+  }
+
+  // Best-effort visual animation for a clicked word
+  async _animateClick(wordSpan) {
+    if (!wordSpan) return;
+    try {
+      wordSpan.style.transform = 'scale(1.15)';
+      setTimeout(() => {
+        try {
+          wordSpan.style.transform = 'scale(1)';
+        } catch (error_) {
+          console.debug('[WordManager] animation restore failed', error_);
+        }
+      }, 150);
+    } catch (error_) {
+      console.debug('[WordManager] animation start failed', error_);
+    }
+  }
+
+  // Perform the storage transition for a given nextState. This is extracted
+  // so the main handler stays small and lower in cognitive complexity.
+  async _applyStateTransition(word, nextState, wordSpan) {
+    switch (nextState) {
+      case globalThis.WORD_STATES.KNOWN:
+        await globalThis.delegateStorageOp('moveToSet', { fromKey: 'unknownWords', toKey: 'knownWords', item: word });
+        this.system.knownWords.add(word);
+        this.system.unknownWords.delete(word);
+        if (wordSpan) wordSpan.className = `mimic-word ${globalThis.WORD_CLASSES[globalThis.WORD_STATES.KNOWN]}`;
+        break;
+      case globalThis.WORD_STATES.LEARNING:
+        await globalThis.delegateStorageOp('moveToSet', { fromKey: 'knownWords', toKey: 'unknownWords', item: word });
+        this.system.unknownWords.add(word);
+        this.system.knownWords.delete(word);
+        if (wordSpan) wordSpan.className = `mimic-word ${globalThis.WORD_CLASSES[globalThis.WORD_STATES.LEARNING]}`;
+        break;
+      case globalThis.WORD_STATES.UNMARKED:
+        await globalThis.delegateStorageOp('removeFromSet', { key: 'knownWords', item: word });
+        await globalThis.delegateStorageOp('removeFromSet', { key: 'unknownWords', item: word });
+        this.system.knownWords.delete(word);
+        this.system.unknownWords.delete(word);
+        if (wordSpan) wordSpan.className = `mimic-word ${globalThis.WORD_CLASSES[globalThis.WORD_STATES.UNMARKED]}`;
+        break;
+      default:
+        break;
+    }
+  }
+
+  // If local context becomes invalidated, try delegating the move to background
+  _delegateMoveOnInvalidated(nextState, word) {
+    try {
+      const fromKey = (nextState === globalThis.WORD_STATES.KNOWN ? 'unknownWords' : 'knownWords');
+      const toKey = (nextState === globalThis.WORD_STATES.KNOWN ? 'knownWords' : 'unknownWords');
+      chrome.runtime.sendMessage({ type: 'storageMove', fromKey, toKey, item: word });
+    } catch (error_) {
+      console.error('[WordManager] delegation failed:', error_);
+    }
   }
 
   async handleWordClick(wordSpan) {
-    const word = wordSpan.dataset.word;
+    const word = wordSpan?.dataset?.word;
     if (!word) return;
 
-    // Prevent concurrent operations
-    if (this.syncLock) {
-      console.debug('Sync in progress, queuing word click for', word);
-      return; // Or queue it, but for now just skip
-    }
+    return this._enqueueSync(async () => {
+      await this._animateClick(wordSpan);
 
-    this.syncLock = true;
+      const currentState = globalThis.getWordState(word, this.system.knownWords, this.system.unknownWords);
+      const nextState = globalThis.getNextWordState(currentState);
 
-    try {
-      // Animate click
-      wordSpan.style.transform = 'scale(1.15)';
-      setTimeout(() => {
-        wordSpan.style.transform = 'scale(1)';
-      }, 150);
-
-      // Get current state
-      const currentState = window.getWordState(word, this.system.knownWords, this.system.unknownWords);
-      const nextState = window.getNextWordState(currentState);
-
-      // Update state using storage manager (prevents race conditions!)
-      switch (nextState) {
-        case window.WORD_STATES.KNOWN:
-          // Move to known (delegate writes to background)
-          await window.delegateStorageOp('removeFromSet', { key: 'unknownWords', item: word });
-          await window.delegateStorageOp('addToSet', { key: 'knownWords', item: word });
-          this.system.knownWords.add(word);
-          this.system.unknownWords.delete(word);
-          wordSpan.className = `mimic-word ${window.WORD_CLASSES[window.WORD_STATES.KNOWN]}`;
-          break;
-
-        case window.WORD_STATES.LEARNING:
-          // Move to learning (delegate writes to background)
-          await window.delegateStorageOp('removeFromSet', { key: 'knownWords', item: word });
-          await window.delegateStorageOp('addToSet', { key: 'unknownWords', item: word });
-          this.system.unknownWords.add(word);
-          this.system.knownWords.delete(word);
-          wordSpan.className = `mimic-word ${window.WORD_CLASSES[window.WORD_STATES.LEARNING]}`;
-          break;
-
-        case window.WORD_STATES.UNMARKED:
-          // Remove from both (delegate writes to background)
-          await window.delegateStorageOp('removeFromSet', { key: 'knownWords', item: word });
-          await window.delegateStorageOp('removeFromSet', { key: 'unknownWords', item: word });
-          this.system.knownWords.delete(word);
-          this.system.unknownWords.delete(word);
-          wordSpan.className = `mimic-word ${window.WORD_CLASSES[window.WORD_STATES.UNMARKED]}`;
-          break;
+      try {
+        await this._applyStateTransition(word, nextState, wordSpan);
+        this.updateAllWordInstances(word);
+      } catch (err) {
+        console.error('[WordManager] handleWordClick storage error:', err);
+        if (err?.message?.includes('Extension context invalidated')) {
+          this._delegateMoveOnInvalidated(nextState, word);
+        }
+        try { if (globalThis?.toast?.error) globalThis.toast.error('Kelime güncellenemedi'); } catch (error_) { console.debug('[WordManager] toast failed', error_); }
       }
-
-      // Update all instances of this word
-      this.updateAllWordInstances(word);
-    } finally {
-      this.syncLock = false;
-    }
+    });
   }
 
   async markAsKnown(word) {
-    console.debug('[Action] markAsKnown invoked for', word);
-
-    // Prevent concurrent operations
-    if (this.syncLock) {
-      console.debug('Sync in progress, queuing markAsKnown for', word);
-      return; // Skip for now
-    }
-
-    this.syncLock = true;
-
-    try {
-  // ATOMIC OPERATION - delegate to background for atomic move
-  await window.delegateStorageOp('moveToSet', { fromKey: 'unknownWords', toKey: 'knownWords', item: word });
-
-      // Update local sets
-      this.system.knownWords.add(word);
-      this.system.unknownWords.delete(word);
-
-      // Update UI
-      this.updateAllWordInstances(word);
-
-      console.log('✅ Marked as known:', word);
-    } catch (err) {
-      console.error('❌ [ERROR] markAsKnown failed for', word, ':', err);
-      console.error('Error stack:', err.stack);
-
-      // If the storage write failed due to context invalidation (service worker or
-      // content script getting torn down), try delegating the operation to the
-      // background service worker which has a more stable lifetime.
-      if (err && err.message && err.message.includes('Extension context invalidated')) {
-        try {
-          chrome.runtime.sendMessage({
-            type: 'storageMove',
-            fromKey: 'unknownWords',
-            toKey: 'knownWords',
-            item: word
-          });
-
-          // Update local sets and UI immediately (background will perform storage)
-          this.system.knownWords.add(word);
-          this.system.unknownWords.delete(word);
-          this.updateAllWordInstances(word);
-
-          console.log('ℹ️ Delegated moveToSet to background for', word);
-          return;
-        } catch (sendErr) {
-          console.error('❌ Failed delegating to background:', sendErr);
-          try { if (window && window.toast && typeof window.toast.error === 'function') window.toast.error('İşlem arka plana devredilemedi'); } catch(e) {}
+  console.debug('[Action] markAsKnown invoked for', word);
+    // Enqueue atomic mark-as-known operation
+    return this._enqueueSync(async () => {
+      try {
+        await globalThis.delegateStorageOp('moveToSet', { fromKey: 'unknownWords', toKey: 'knownWords', item: word });
+        this.system.knownWords.add(word);
+        this.system.unknownWords.delete(word);
+        this.updateAllWordInstances(word);
+        console.log('✅ Marked as known:', word);
+      } catch (err) {
+        console.error('❌ [ERROR] markAsKnown failed for', word, ':', err);
+        if (err?.message?.includes('Extension context invalidated')) {
+          try {
+            chrome.runtime.sendMessage({ type: 'storageMove', fromKey: 'unknownWords', toKey: 'knownWords', item: word });
+            this.system.knownWords.add(word);
+            this.system.unknownWords.delete(word);
+            this.updateAllWordInstances(word);
+            console.log('ℹ️ Delegated moveToSet to background for', word);
+            return;
+          } catch (error_) {
+            console.error('❌ Failed delegating to background:', error_);
+          }
         }
+        try { if (globalThis?.toast?.error) globalThis.toast.error('İşlem başarısız'); } catch (error_) { console.debug('[WordManager] toast failed', error_); }
       }
-
-      window.toast.error(`ERROR: ${err.message}`);
-    } finally {
-      this.syncLock = false;
-    }
+    });
   }
 
   async markAsUnknown(word) {
-    console.debug('[Action] markAsUnknown invoked for', word);
-
-    // Prevent concurrent operations
-    if (this.syncLock) {
-      console.debug('Sync in progress, queuing markAsUnknown for', word);
-      return; // Skip for now
-    }
-
-    this.syncLock = true;
-
-    try {
-  // ATOMIC OPERATION - delegate to background for atomic move
-  await window.delegateStorageOp('moveToSet', { fromKey: 'knownWords', toKey: 'unknownWords', item: word });
-
-      // Update local sets
-      this.system.unknownWords.add(word);
-      this.system.knownWords.delete(word);
-
-      // Update UI
-      this.updateAllWordInstances(word);
-
-      console.log('📖 Marked as learning:', word);
-    } catch (err) {
-      console.error('❌ [ERROR] markAsUnknown failed for', word, ':', err);
-      console.error('Error stack:', err.stack);
-
-      if (err && err.message && err.message.includes('Extension context invalidated')) {
-        try {
-          chrome.runtime.sendMessage({
-            type: 'storageMove',
-            fromKey: 'knownWords',
-            toKey: 'unknownWords',
-            item: word
-          });
-
-          this.system.unknownWords.add(word);
-          this.system.knownWords.delete(word);
-          this.updateAllWordInstances(word);
-
-          console.log('ℹ️ Delegated moveToSet to background for', word);
-          return;
-        } catch (sendErr) {
-          console.error('❌ Failed delegating to background:', sendErr);
+  console.debug('[Action] markAsUnknown invoked for', word);
+    return this._enqueueSync(async () => {
+      try {
+        await globalThis.delegateStorageOp('moveToSet', { fromKey: 'knownWords', toKey: 'unknownWords', item: word });
+        this.system.unknownWords.add(word);
+        this.system.knownWords.delete(word);
+        this.updateAllWordInstances(word);
+        console.log('📖 Marked as learning:', word);
+      } catch (err) {
+        console.error('❌ [ERROR] markAsUnknown failed for', word, ':', err);
+        if (err?.message?.includes('Extension context invalidated')) {
+          try {
+            chrome.runtime.sendMessage({ type: 'storageMove', fromKey: 'knownWords', toKey: 'unknownWords', item: word });
+            this.system.unknownWords.add(word);
+            this.system.knownWords.delete(word);
+            this.updateAllWordInstances(word);
+            console.log('ℹ️ Delegated moveToSet to background for', word);
+            return;
+          } catch (error_) {
+            console.error('❌ Failed delegating to background:', error_);
+          }
         }
+        try { if (globalThis?.toast?.error) globalThis.toast.error('İşlem başarısız'); } catch (error_) { console.debug('[WordManager] toast failed', error_); }
       }
-
-      window.toast.error(`ERROR: ${err.message}`);
-    } finally {
-      this.syncLock = false;
-    }
+    });
   }
 
   async removeFromList(word) {
     console.debug('[Action] removeFromList invoked for', word);
-
-    // Prevent concurrent operations
-    if (this.syncLock) {
-      console.debug('Sync in progress, queuing removeFromList for', word);
-      return; // Skip for now
-    }
-
-    this.syncLock = true;
-
-    try {
-      // Remove from both lists atomically via background set
-      const knownArray = Array.from(this.system.knownWords).filter(w => w !== word);
-      const unknownArray = Array.from(this.system.unknownWords).filter(w => w !== word);
-
-      await window.delegateStorageOp('set', { knownWords: knownArray, unknownWords: unknownArray });
-
-      // Update local sets
-      this.system.knownWords.delete(word);
-      this.system.unknownWords.delete(word);
-
-      // Update UI
-      this.updateAllWordInstances(word);
-
-      console.log('🗑️ Removed from lists:', word);
-    } catch (err) {
-  console.error('❌ [ERROR] removeFromList failed for', word, ':', err);
-  try { if (window && window.toast && typeof window.toast.error === 'function') window.toast.error('Kelime listeden silinemedi'); } catch(e) {}
-    } finally {
-      this.syncLock = false;
-    }
+    return this._enqueueSync(async () => {
+      try {
+        const knownArray = Array.from(this.system.knownWords).filter(w => w !== word);
+        const unknownArray = Array.from(this.system.unknownWords).filter(w => w !== word);
+        await globalThis.delegateStorageOp('set', { knownWords: knownArray, unknownWords: unknownArray });
+        this.system.knownWords.delete(word);
+        this.system.unknownWords.delete(word);
+        this.updateAllWordInstances(word);
+        console.log('🗑️ Removed from lists:', word);
+      } catch (err) {
+        console.error('❌ [ERROR] removeFromList failed for', word, ':', err);
+        try { if (globalThis?.toast?.error) globalThis.toast.error('Kelime listeden silinemedi'); } catch (error_) { console.debug('[WordManager] toast failed', error_); }
+      }
+    });
   }
 
   getWordStatus(word) {
-    return window.getWordState(word, this.system.knownWords, this.system.unknownWords);
+    return globalThis.getWordState(word, this.system.knownWords, this.system.unknownWords);
   }
 
   updateAllWordInstances(word) {
     // Update all instances of this word in all lines
     const allWords = this.system.mimicContainer.querySelectorAll(`.mimic-word[data-word="${word}"]`);
-    const state = window.getWordState(word, this.system.knownWords, this.system.unknownWords);
-    const className = window.WORD_CLASSES[state];
+    const state = globalThis.getWordState(word, this.system.knownWords, this.system.unknownWords);
+    const className = globalThis.WORD_CLASSES[state];
 
     console.debug('🔁 updateAllWordInstances:', {
       word,
       found: allWords.length,
       state,
       className,
-      WORD_CLASSES: window.WORD_CLASSES
+      WORD_CLASSES: globalThis.WORD_CLASSES
     });
 
-    allWords.forEach((span, index) => {
+    let index = 0;
+    for (const span of allWords) {
       const oldClass = span.className;
       span.className = `mimic-word ${className}`;
       console.debug(`  [${index}] Updated:`, oldClass, '→', span.className, span);
-    });
+      index += 1;
+    }
   }
 };
